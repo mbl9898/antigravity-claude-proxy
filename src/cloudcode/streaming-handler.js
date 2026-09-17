@@ -77,35 +77,37 @@ export async function* sendMessageStream(anthropicRequest, accountManager, fallb
             }
 
             if (accountManager.isAllRateLimited(model)) {
-                const minWaitMs = accountManager.getMinWaitTimeMs(model);
+                const minWaitMs = Math.max(accountManager.getMinWaitTimeMs(model), 1000);
                 const resetTime = new Date(Date.now() + minWaitMs).toISOString();
 
-                // If wait time is too long (> 2 minutes), try fallback first, then throw error
-                if (minWaitMs > MAX_WAIT_BEFORE_ERROR_MS) {
-                    // Check if fallback is enabled and available
-                    if (fallbackEnabled) {
-                        const fallbackModel = getFallbackModel(model);
-                        if (fallbackModel) {
-                            logger.warn(`[CloudCode] All accounts exhausted for ${model} (${formatDuration(minWaitMs)} wait). Attempting fallback to ${fallbackModel} (streaming)`);
-                            const fallbackRequest = { ...anthropicRequest, model: fallbackModel };
-                            yield* sendMessageStream(fallbackRequest, accountManager, false);
-                            return;
-                        }
+                // Check if fallback is enabled and available immediately to avoid CLI client timeouts
+                if (fallbackEnabled) {
+                    const fallbackModel = getFallbackModel(model);
+                    if (fallbackModel && fallbackModel !== model) {
+                        logger.warn(`[CloudCode] All accounts exhausted for ${model} (${formatDuration(minWaitMs)} wait). Immediately falling back to ${fallbackModel} (streaming)`);
+                        const fallbackRequest = { ...anthropicRequest, model: fallbackModel };
+                        yield* sendMessageStream(fallbackRequest, accountManager, false);
+                        return;
                     }
+                }
+
+                // If wait time is too long (> 2 minutes), throw error
+                if (minWaitMs > MAX_WAIT_BEFORE_ERROR_MS) {
                     throw new Error(
                         `RESOURCE_EXHAUSTED: Rate limited on ${model}. Quota will reset after ${formatDuration(minWaitMs)}. Next available: ${resetTime}`
                     );
                 }
 
-                // Wait for shortest reset time
+                // Wait for shortest reset time if no fallback available.
+                // Add per-handler random jitter (0–2000ms) to stagger wakeups and
+                // prevent thundering-herd: multiple concurrent handlers must NOT all
+                // grab the same account the instant its 30s cooldown expires.
                 const accountCount = accountManager.getAccountCount();
-                logger.warn(`[CloudCode] All ${accountCount} account(s) rate-limited. Waiting ${formatDuration(minWaitMs)}...`);
-                await sleep(minWaitMs + 500); // Add 500ms buffer
+                const jitterMs = Math.floor(Math.random() * 2000);
+                logger.warn(`[CloudCode] All ${accountCount} account(s) rate-limited. Waiting ${formatDuration(minWaitMs + jitterMs)}...`);
+                await sleep(minWaitMs + 500 + jitterMs);
                 accountManager.clearExpiredLimits();
-
-                // CRITICAL FIX: Don't count waiting for rate limits as a failed attempt
-                // This prevents "Max retries exceeded" when we are just patiently waiting
-                attempt--;
+                attempt = 0; // Reset attempts to cycle through fresh accounts
                 continue; // Retry the loop
             }
 
@@ -186,72 +188,32 @@ export async function* sendMessageStream(anthropicRequest, accountManager, fallb
                             // Check if capacity issue (NOT quota) - retry same endpoint with progressive backoff
                             if (isModelCapacityExhausted(errorText)) {
                                 if (capacityRetryCount < MAX_CAPACITY_RETRIES) {
-                                    // Progressive capacity backoff tiers
                                     const tierIndex = Math.min(capacityRetryCount, CAPACITY_BACKOFF_TIERS_MS.length - 1);
                                     const waitMs = resetMs || CAPACITY_BACKOFF_TIERS_MS[tierIndex];
                                     capacityRetryCount++;
-                                    // Track failures for progressive backoff escalation (matches opencode-antigravity-auth)
                                     accountManager.incrementConsecutiveFailures(account.email);
                                     logger.info(`[CloudCode] Model capacity exhausted, retry ${capacityRetryCount}/${MAX_CAPACITY_RETRIES} after ${formatDuration(waitMs)}...`);
                                     await sleep(waitMs);
-                                    // Don't increment endpointIndex - retry same endpoint
                                     continue;
                                 }
-                                // Max capacity retries exceeded - treat as quota exhaustion
                                 logger.warn(`[CloudCode] Max capacity retries (${MAX_CAPACITY_RETRIES}) exceeded, switching account`);
-                            }
-
-                            // Get rate limit backoff with exponential backoff and state reset
-                            const backoff = getRateLimitBackoff(account.email, model, resetMs);
-
-                            // For very short rate limits (< 1 second), always wait and retry
-                            // Switching accounts won't help when all accounts have per-second rate limits
-                            if (resetMs !== null && resetMs < 1000) {
-                                const waitMs = resetMs;
-                                logger.info(`[CloudCode] Short rate limit on ${account.email} (${resetMs}ms), waiting and retrying...`);
-                                await sleep(waitMs);
-                                // Don't increment endpointIndex - retry same endpoint
-                                continue;
-                            }
-
-                            // If within dedup window AND reset time is >= 1s, switch account
-                            if (backoff.isDuplicate) {
-                                const smartBackoffMs = calculateSmartBackoff(errorText, resetMs, consecutiveFailures);
-                                logger.info(`[CloudCode] Skipping retry due to recent rate limit on ${account.email} (attempt ${backoff.attempt}), switching account...`);
-                                accountManager.markRateLimited(account.email, smartBackoffMs, model);
-                                throw new Error(`RATE_LIMITED_DEDUP: ${errorText}`);
                             }
 
                             // Calculate smart backoff based on error type
                             const smartBackoffMs = calculateSmartBackoff(errorText, resetMs, consecutiveFailures);
+                            accountManager.markRateLimited(account.email, smartBackoffMs, model);
 
-                            // Decision: wait and retry OR switch account
-                            // First 429 gets a quick 1s retry (FIRST_RETRY_DELAY_MS)
-                            if (backoff.attempt === 1 && smartBackoffMs <= DEFAULT_COOLDOWN_MS) {
-                                // Quick 1s retry on first 429 (matches opencode-antigravity-auth)
-                                const waitMs = backoff.delayMs;
-                                // markRateLimited already increments consecutiveFailures internally
-                                accountManager.markRateLimited(account.email, waitMs, model);
-                                logger.info(`[CloudCode] First rate limit on ${account.email}, quick retry after ${formatDuration(waitMs)}...`);
-                                await sleep(waitMs);
-                                // Don't increment endpointIndex - retry same endpoint
-                                continue;
-                            } else if (smartBackoffMs > DEFAULT_COOLDOWN_MS) {
-                                // Long-term quota exhaustion (> 10s) - wait SWITCH_ACCOUNT_DELAY_MS then switch
-                                logger.info(`[CloudCode] Quota exhausted for ${account.email} (${formatDuration(smartBackoffMs)}), switching account after ${formatDuration(SWITCH_ACCOUNT_DELAY_MS)} delay...`);
-                                await sleep(SWITCH_ACCOUNT_DELAY_MS);
-                                accountManager.markRateLimited(account.email, smartBackoffMs, model);
+                            // If we have other accounts available, immediately switch without retrying same account
+                            if (accountManager.getAccountCount() > 1) {
+                                logger.info(`[CloudCode] Account ${account.email} rate-limited (${formatDuration(smartBackoffMs)}), rotating to next account...`);
                                 throw new Error(`QUOTA_EXHAUSTED: ${errorText}`);
-                            } else {
-                                // Short-term rate limit but not first attempt - use exponential backoff delay
-                                const waitMs = backoff.delayMs;
-                                // markRateLimited already increments consecutiveFailures internally
-                                accountManager.markRateLimited(account.email, waitMs, model);
-                                logger.info(`[CloudCode] Rate limit on ${account.email} (attempt ${backoff.attempt}), waiting ${formatDuration(waitMs)}...`);
-                                await sleep(waitMs);
-                                // Don't increment endpointIndex - retry same endpoint
-                                continue;
                             }
+
+                            // If single account, apply backoff delay
+                            const backoff = getRateLimitBackoff(account.email, model, resetMs);
+                            logger.info(`[CloudCode] Rate limit on single account ${account.email}, waiting ${formatDuration(backoff.delayMs)}...`);
+                            await sleep(backoff.delayMs);
+                            continue;
                         }
 
                         // Check for 503/529 MODEL_CAPACITY_EXHAUSTED - use progressive backoff like 429 capacity
@@ -275,8 +237,15 @@ export async function* sendMessageStream(anthropicRequest, accountManager, fallb
                         }
 
                         // 400 errors are client errors - fail immediately, don't retry or switch accounts
-                        // Examples: token limit exceeded, invalid schema, malformed request
+                        // EXCEPTION: Gemini "model output must contain either output text or tool calls"
+                        // This is a safety-filter empty-output error — retriable on a different account
                         if (response.status === 400) {
+                            if (errorText.includes('model output must contain') ||
+                                errorText.includes('both be empty') ||
+                                errorText.toLowerCase().includes('model output error')) {
+                                logger.warn(`[CloudCode] Gemini empty-output 400 (retriable), switching account...`);
+                                throw new Error(`MODEL_OUTPUT_RETRIABLE: ${errorText}`);
+                            }
                             logger.error(`[CloudCode] Invalid request (400): ${errorText.substring(0, 200)}`);
                             throw new Error(`invalid_request_error: ${errorText}`);
                         }
@@ -435,6 +404,7 @@ export async function* sendMessageStream(anthropicRequest, accountManager, fallb
                 if (error.message?.includes('RATE_LIMITED_DEDUP')) {
                     attempt--;
                 }
+                await sleep(SWITCH_ACCOUNT_DELAY_MS);
                 continue;
             }
             if (isAuthError(error)) {
@@ -447,6 +417,12 @@ export async function* sendMessageStream(anthropicRequest, accountManager, fallb
                 // Already marked with cooldown, notify strategy and rotate to next account
                 accountManager.notifyFailure(account, model);
                 logger.warn(`[CloudCode] Account ${account.email} forbidden (403 VALIDATION_REQUIRED), trying next...`);
+                continue;
+            }
+            // Gemini empty-output 400 (safety filter wiped all candidates) — switch account and retry
+            if (error.message?.includes('MODEL_OUTPUT_RETRIABLE')) {
+                accountManager.notifyFailure(account, model);
+                logger.warn(`[CloudCode] Model output error on ${account.email}, switching account...`);
                 continue;
             }
             // Handle 5xx errors

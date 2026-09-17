@@ -78,34 +78,32 @@ export async function sendMessage(anthropicRequest, accountManager, fallbackEnab
             }
 
             if (accountManager.isAllRateLimited(model)) {
-                const minWaitMs = accountManager.getMinWaitTimeMs(model);
+                const minWaitMs = Math.max(accountManager.getMinWaitTimeMs(model), 1000);
                 const resetTime = new Date(Date.now() + minWaitMs).toISOString();
 
-                // If wait time is too long (> 2 minutes), try fallback first, then throw error
-                if (minWaitMs > MAX_WAIT_BEFORE_ERROR_MS) {
-                    // Check if fallback is enabled and available
-                    if (fallbackEnabled) {
-                        const fallbackModel = getFallbackModel(model);
-                        if (fallbackModel) {
-                            logger.warn(`[CloudCode] All accounts exhausted for ${model} (${formatDuration(minWaitMs)} wait). Attempting fallback to ${fallbackModel}`);
-                            const fallbackRequest = { ...anthropicRequest, model: fallbackModel };
-                            return await sendMessage(fallbackRequest, accountManager, false);
-                        }
+                // Check if fallback is enabled and available immediately to avoid CLI client timeouts
+                if (fallbackEnabled) {
+                    const fallbackModel = getFallbackModel(model);
+                    if (fallbackModel && fallbackModel !== model) {
+                        logger.warn(`[CloudCode] All accounts exhausted for ${model} (${formatDuration(minWaitMs)} wait). Immediately falling back to ${fallbackModel}`);
+                        const fallbackRequest = { ...anthropicRequest, model: fallbackModel };
+                        return await sendMessage(fallbackRequest, accountManager, false);
                     }
+                }
+
+                // If wait time is too long (> 2 minutes), throw error
+                if (minWaitMs > MAX_WAIT_BEFORE_ERROR_MS) {
                     throw new Error(
                         `RESOURCE_EXHAUSTED: Rate limited on ${model}. Quota will reset after ${formatDuration(minWaitMs)}. Next available: ${resetTime}`
                     );
                 }
 
-                // Wait for shortest reset time
+                // Wait for shortest reset time if no fallback available
                 const accountCount = accountManager.getAccountCount();
                 logger.warn(`[CloudCode] All ${accountCount} account(s) rate-limited. Waiting ${formatDuration(minWaitMs)}...`);
                 await sleep(minWaitMs + 500); // Add 500ms buffer
                 accountManager.clearExpiredLimits();
-
-                // CRITICAL FIX: Don't count waiting for rate limits as a failed attempt
-                // This prevents "Max retries exceeded" when we are just patiently waiting
-                attempt--;
+                attempt = 0; // Reset attempts to cycle through fresh accounts
                 continue; // Retry the loop
             }
 
@@ -189,73 +187,32 @@ export async function sendMessage(anthropicRequest, accountManager, fallbackEnab
                             // Check if capacity issue (NOT quota) - retry same endpoint with progressive backoff
                             if (isModelCapacityExhausted(errorText)) {
                                 if (capacityRetryCount < MAX_CAPACITY_RETRIES) {
-                                    // Progressive capacity backoff tiers
                                     const tierIndex = Math.min(capacityRetryCount, CAPACITY_BACKOFF_TIERS_MS.length - 1);
                                     const waitMs = resetMs || CAPACITY_BACKOFF_TIERS_MS[tierIndex];
                                     capacityRetryCount++;
-                                    // Track failures for progressive backoff escalation (matches opencode-antigravity-auth)
                                     accountManager.incrementConsecutiveFailures(account.email);
                                     logger.info(`[CloudCode] Model capacity exhausted, retry ${capacityRetryCount}/${MAX_CAPACITY_RETRIES} after ${formatDuration(waitMs)}...`);
                                     await sleep(waitMs);
-                                    // Don't increment endpointIndex - retry same endpoint
                                     continue;
                                 }
-                                // Max capacity retries exceeded - treat as quota exhaustion
                                 logger.warn(`[CloudCode] Max capacity retries (${MAX_CAPACITY_RETRIES}) exceeded, switching account`);
-                            }
-
-                            // Get rate limit backoff with exponential backoff and state reset
-                            const backoff = getRateLimitBackoff(account.email, model, resetMs);
-
-                            // For very short rate limits (< 1 second), always wait and retry
-                            // Switching accounts won't help when all accounts have per-second rate limits
-                            if (resetMs !== null && resetMs < 1000) {
-                                const waitMs = resetMs;
-                                logger.info(`[CloudCode] Short rate limit on ${account.email} (${resetMs}ms), waiting and retrying...`);
-                                await sleep(waitMs);
-                                // Don't increment endpointIndex - retry same endpoint
-                                continue;
-                            }
-
-                            // If within dedup window AND reset time is >= 1s, switch account
-                            if (backoff.isDuplicate) {
-                                const smartBackoffMs = calculateSmartBackoff(errorText, resetMs, consecutiveFailures);
-                                logger.info(`[CloudCode] Skipping retry due to recent rate limit on ${account.email} (attempt ${backoff.attempt}), switching account...`);
-                                accountManager.markRateLimited(account.email, smartBackoffMs, model);
-                                throw new Error(`RATE_LIMITED_DEDUP: ${errorText}`);
                             }
 
                             // Calculate smart backoff based on error type
                             const smartBackoffMs = calculateSmartBackoff(errorText, resetMs, consecutiveFailures);
+                            accountManager.markRateLimited(account.email, smartBackoffMs, model);
 
-                            // Decision: wait and retry OR switch account
-                            // First 429 gets a quick 1s retry (FIRST_RETRY_DELAY_MS)
-                            if (backoff.attempt === 1 && smartBackoffMs <= DEFAULT_COOLDOWN_MS) {
-                                // Quick 1s retry on first 429 (matches opencode-antigravity-auth)
-                                const waitMs = backoff.delayMs;
-                                // markRateLimited already increments consecutiveFailures internally
-                                // This prevents concurrent retry storms and ensures progressive backoff escalation
-                                accountManager.markRateLimited(account.email, waitMs, model);
-                                logger.info(`[CloudCode] First rate limit on ${account.email}, quick retry after ${formatDuration(waitMs)}...`);
-                                await sleep(waitMs);
-                                // Don't increment endpointIndex - retry same endpoint
-                                continue;
-                            } else if (smartBackoffMs > DEFAULT_COOLDOWN_MS) {
-                                // Long-term quota exhaustion (> 10s) - wait SWITCH_ACCOUNT_DELAY_MS then switch
-                                logger.info(`[CloudCode] Quota exhausted for ${account.email} (${formatDuration(smartBackoffMs)}), switching account after ${formatDuration(SWITCH_ACCOUNT_DELAY_MS)} delay...`);
-                                await sleep(SWITCH_ACCOUNT_DELAY_MS);
-                                accountManager.markRateLimited(account.email, smartBackoffMs, model);
+                            // If we have other accounts available, immediately switch without retrying same account
+                            if (accountManager.getAccountCount() > 1) {
+                                logger.info(`[CloudCode] Account ${account.email} rate-limited (${formatDuration(smartBackoffMs)}), rotating to next account...`);
                                 throw new Error(`QUOTA_EXHAUSTED: ${errorText}`);
-                            } else {
-                                // Short-term rate limit but not first attempt - use exponential backoff delay
-                                const waitMs = backoff.delayMs;
-                                // markRateLimited already increments consecutiveFailures internally
-                                accountManager.markRateLimited(account.email, waitMs, model);
-                                logger.info(`[CloudCode] Rate limit on ${account.email} (attempt ${backoff.attempt}), waiting ${formatDuration(waitMs)}...`);
-                                await sleep(waitMs);
-                                // Don't increment endpointIndex - retry same endpoint
-                                continue;
                             }
+
+                            // If single account, apply backoff delay
+                            const backoff = getRateLimitBackoff(account.email, model, resetMs);
+                            logger.info(`[CloudCode] Rate limit on single account ${account.email}, waiting ${formatDuration(backoff.delayMs)}...`);
+                            await sleep(backoff.delayMs);
+                            continue;
                         }
 
                         if (response.status >= 400) {
@@ -375,6 +332,7 @@ export async function sendMessage(anthropicRequest, accountManager, fallbackEnab
                 if (error.message?.includes('RATE_LIMITED_DEDUP')) {
                     attempt--;
                 }
+                await sleep(SWITCH_ACCOUNT_DELAY_MS);
                 continue;
             }
             if (isAuthError(error)) {

@@ -24,7 +24,7 @@ import usageStats from './modules/usage-stats.js';
 
 // Parse fallback flag directly from command line args to avoid circular dependency
 const args = process.argv.slice(2);
-const FALLBACK_ENABLED = args.includes('--fallback') || process.env.FALLBACK === 'true';
+const FALLBACK_ENABLED = config?.fallbackEnabled !== false || args.includes('--fallback') || process.env.FALLBACK === 'true';
 
 // Parse --strategy flag (format: --strategy=sticky or --strategy sticky)
 let STRATEGY_OVERRIDE = null;
@@ -43,6 +43,33 @@ app.disable('x-powered-by');
 
 // Initialize account manager (will be fully initialized on first request or startup)
 export const accountManager = new AccountManager();
+
+// ─── Concurrency Limiter ────────────────────────────────────────────────────
+// Claude Code fires 4-6 concurrent requests at startup (main + session title +
+// subagents). Without a cap they all race through the same 21 accounts and burn
+// per-minute quotas in < 2s. This semaphore serialises upstream calls to 2
+// concurrent: enough for responsiveness without the thundering-herd burn.
+const MAX_CONCURRENT_UPSTREAM = 2;
+let _activeCalls = 0;
+const _waitQueue = [];
+
+async function acquireUpstreamSlot() {
+    if (_activeCalls < MAX_CONCURRENT_UPSTREAM) {
+        _activeCalls++;
+        return;
+    }
+    await new Promise(resolve => _waitQueue.push(resolve));
+    _activeCalls++;
+}
+
+function releaseUpstreamSlot() {
+    _activeCalls = Math.max(0, _activeCalls - 1);
+    if (_waitQueue.length > 0) {
+        const next = _waitQueue.shift();
+        next();
+    }
+}
+// ───────────────────────────────────────────────────────────────────────────
 
 // Track initialization status
 let isInitialized = false;
@@ -683,16 +710,51 @@ app.get('/v1/models', async (req, res) => {
 
 /**
  * Count tokens endpoint - Anthropic Messages API compatible
- * Uses local tokenization with official tokenizers (@anthropic-ai/tokenizer for Claude, @lenml/tokenizer-gemini for Gemini)
  */
 app.post('/v1/messages/count_tokens', (req, res) => {
-    res.status(501).json({
-        type: 'error',
-        error: {
-            type: 'not_implemented',
-            message: 'Token counting is not implemented. Use /v1/messages with max_tokens or configure your client to skip token counting.'
+    try {
+        const { messages = [], system = '', tools = [] } = req.body || {};
+        let totalChars = 0;
+
+        if (typeof system === 'string') {
+            totalChars += system.length;
+        } else if (Array.isArray(system)) {
+            for (const part of system) {
+                if (part?.text) totalChars += part.text.length;
+            }
         }
-    });
+
+        if (Array.isArray(messages)) {
+            for (const msg of messages) {
+                if (typeof msg?.content === 'string') {
+                    totalChars += msg.content.length;
+                } else if (Array.isArray(msg?.content)) {
+                    for (const block of msg.content) {
+                        if (block?.text) totalChars += block.text.length;
+                        if (block?.thinking) totalChars += block.thinking.length;
+                        if (block?.input) totalChars += JSON.stringify(block.input).length;
+                        if (block?.content) totalChars += typeof block.content === 'string' ? block.content.length : JSON.stringify(block.content).length;
+                    }
+                }
+            }
+        }
+
+        if (Array.isArray(tools)) {
+            totalChars += JSON.stringify(tools).length;
+        }
+
+        // Standard token estimation (~3.8 characters per token)
+        const inputTokens = Math.max(1, Math.ceil(totalChars / 3.8));
+
+        return res.status(200).json({
+            input_tokens: inputTokens
+        });
+    } catch (err) {
+        logger.error('[API] Error in count_tokens:', err);
+        return res.status(200).json({
+            input_tokens: 1
+        });
+    }
 });
 
 /**
@@ -730,7 +792,17 @@ app.post('/v1/messages', async (req, res) => {
             const targetModel = modelMapping[requestedModel].mapping;
             logger.info(`[Server] Mapping model ${requestedModel} -> ${targetModel}`);
             requestedModel = targetModel;
+        } else if (/\[.*?\]$/.test(requestedModel)) {
+            const stripped = requestedModel.replace(/\[.*?\]$/, '');
+            if (modelMapping[stripped] && modelMapping[stripped].mapping) {
+                requestedModel = modelMapping[stripped].mapping;
+            } else {
+                requestedModel = stripped;
+            }
+            logger.info(`[Server] Normalized model suffix: ${model} -> ${requestedModel}`);
         }
+
+        logger.info(`[API] Received request for model: "${model}" -> resolved: "${requestedModel}", stream: ${stream}, messages count: ${messages?.length}, tools count: ${tools?.length || 0}`);
 
         const modelId = requestedModel;
 
@@ -744,13 +816,6 @@ app.post('/v1/messages', async (req, res) => {
             if (!valid) {
                 throw new Error(`invalid_request_error: Invalid model: ${modelId}. Use /v1/models to see available models.`);
             }
-        }
-
-        // Optimistic Retry: If ALL accounts are rate-limited for this model, reset them to force a fresh check.
-        // If we have some available accounts, we try them first.
-        if (accountManager.isAllRateLimited(modelId)) {
-            logger.warn(`[Server] All accounts rate-limited for ${modelId}. Resetting state for optimistic retry.`);
-            accountManager.resetAllRateLimits();
         }
 
         // Validate required fields
@@ -802,6 +867,7 @@ app.post('/v1/messages', async (req, res) => {
             // Do NOT flush headers immediately. We need to wait for the first chunk
             // to ensure we don't send a 200 OK if the upstream fails immediately (e.g. 429/503).
 
+            await acquireUpstreamSlot();
             try {
                 // Initialize the generator
                 const generator = sendMessageStream(request, accountManager, FALLBACK_ENABLED);
@@ -858,12 +924,19 @@ app.post('/v1/messages', async (req, res) => {
                     error: { type: errorType, message: errorMessage }
                 })}\n\n`);
                 res.end();
+            } finally {
+                releaseUpstreamSlot();
             }
 
         } else {
             // Handle non-streaming response
-            const response = await sendMessage(request, accountManager, FALLBACK_ENABLED);
-            res.json(response);
+            await acquireUpstreamSlot();
+            try {
+                const response = await sendMessage(request, accountManager, FALLBACK_ENABLED);
+                res.json(response);
+            } finally {
+                releaseUpstreamSlot();
+            }
         }
 
     } catch (error) {

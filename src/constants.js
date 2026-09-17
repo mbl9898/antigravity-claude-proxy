@@ -276,12 +276,21 @@ export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_CONFIG.callbackPort}
 export const ANTIGRAVITY_SYSTEM_INSTRUCTION = `You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**`;
 
 // Model fallback mapping - maps primary model to fallback when quota exhausted
+// IMPORTANT: Gemini models fall back to claude-sonnet-4-6 (not each other) to
+// avoid a 3.7↔3.8 loop when all accounts are simultaneously exhausted.
 export const MODEL_FALLBACK_MAP = {
     'gemini-3.1-pro-high': 'claude-opus-4-6-thinking',
     'gemini-3.1-pro-low': 'claude-sonnet-4-6',
-    'gemini-3-flash': 'claude-sonnet-4-6',
-    'claude-opus-4-6-thinking': 'gemini-3.1-pro-high',
-    'claude-sonnet-4-6': 'gemini-3-flash'
+    'gemini-3-flash': 'gemini-3.7-flash-high',
+    'gemini-3.7-flash-high': 'claude-sonnet-4-6',      // 3.7 exhausted → Sonnet
+    'gemini-3.7-flash-medium': 'claude-sonnet-4-6',
+    'gemini-3.7-flash-tiered': 'gemini-3.7-flash-high',
+    'gemini-3.8-flash-high': 'claude-sonnet-4-6',
+    'gemini-3.8-flash-medium': 'claude-sonnet-4-6',
+    'gemini-3.8-flash-tiered': 'claude-sonnet-4-6',
+    'gemini-3.8-flash-low': 'claude-sonnet-4-6',       // 3.8 exhausted → Sonnet
+    'claude-opus-4-6-thinking': 'claude-sonnet-4-6',
+    'claude-sonnet-4-6': 'gemini-3.7-flash-high'
 };
 
 // Default test models for each family (used by test suite)
@@ -310,11 +319,11 @@ export const DEFAULT_PRESETS = [
         config: {
             ANTHROPIC_AUTH_TOKEN: 'test',
             ANTHROPIC_BASE_URL: 'http://localhost:8080',
-            ANTHROPIC_MODEL: 'gemini-3.1-pro-low',
-            ANTHROPIC_DEFAULT_OPUS_MODEL: 'gemini-3.1-pro-low',
-            ANTHROPIC_DEFAULT_SONNET_MODEL: 'gemini-3.5-flash-low',
-            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'gemini-3.5-flash-low',
-            CLAUDE_CODE_SUBAGENT_MODEL: 'gemini-3.5-flash-low',
+            ANTHROPIC_MODEL: 'gemini-3.7-flash-tiered',
+            ANTHROPIC_DEFAULT_OPUS_MODEL: 'gemini-3.7-flash-tiered',
+            ANTHROPIC_DEFAULT_SONNET_MODEL: 'gemini-3.8-flash-tiered',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'gemini-3.8-flash-tiered',
+            CLAUDE_CODE_SUBAGENT_MODEL: 'gemini-3.8-flash-tiered',
             ENABLE_EXPERIMENTAL_MCP_CLI: 'true'
         }
     }

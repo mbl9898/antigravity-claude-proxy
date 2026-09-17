@@ -72,8 +72,11 @@ export function isNetworkError(error) {
     );
 }
 
+let lastRequestTime = 0;
+let requestQueue = Promise.resolve();
+
 /**
- * Throttled fetch that applies a configurable delay before each request
+ * Throttled fetch that applies a configurable delay between requests
  * Only applies delay when requestThrottlingEnabled is true
  * @param {string|URL} url - The URL to fetch
  * @param {RequestInit} [options] - Fetch options
@@ -83,7 +86,15 @@ export async function throttledFetch(url, options) {
     if (config.requestThrottlingEnabled) {
         const delayMs = config.requestDelayMs || 200;
         if (delayMs > 0) {
-            await sleep(delayMs);
+            requestQueue = requestQueue.then(async () => {
+                const now = Date.now();
+                const elapsed = now - lastRequestTime;
+                if (elapsed < delayMs) {
+                    await sleep(delayMs - elapsed);
+                }
+                lastRequestTime = Date.now();
+            }).catch(() => {});
+            await requestQueue;
         }
     }
     return fetch(url, options);
